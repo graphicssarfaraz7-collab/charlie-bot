@@ -1,16 +1,12 @@
 import os
 import json
 import base64
-import asyncio
 import threading
 from datetime import datetime
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import requests
-
-# ============================================
-# EARNKARO BOT — Fixed Version
-# ============================================
+import io
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PORT = int(os.environ.get("PORT", 8080))
@@ -73,7 +69,6 @@ def get_photo_base64(file_id):
         return None
 
 def process_message(message):
-    """Telegram message ko process karo aur proof banao"""
     chat = message.get("chat", {})
     channel_name = chat.get("username") or chat.get("title") or str(chat.get("id", ""))
     if channel_name and not channel_name.startswith("@"):
@@ -86,12 +81,18 @@ def process_message(message):
     has_affiliate, found_link = check_affiliate_link(text)
     all_links = extract_all_links(text)
 
-    # Photo capture
-    photo_b64 = None
+    # Photo file_id store karo (base64 nahi — file_id se baad mein fetch karenge)
+    photo_file_id = None
     photos = message.get("photo")
     if photos:
-        best_photo = photos[-1]
-        photo_b64 = get_photo_base64(best_photo["file_id"])
+        photo_file_id = photos[-1]["file_id"]
+        print(f"📸 Photo found: {photo_file_id[:20]}...")
+
+    # Immediately fetch photo as base64 and store
+    photo_b64 = None
+    if photo_file_id:
+        photo_b64 = get_photo_base64(photo_file_id)
+        print(f"📸 Photo fetched: {'OK' if photo_b64 else 'FAILED'}")
 
     proof = {
         "id": f"{chat.get('id')}_{post_id}_{int(datetime.now().timestamp())}",
@@ -103,16 +104,20 @@ def process_message(message):
         "affiliate_link": found_link,
         "has_affiliate_link": has_affiliate,
         "status": "Verified" if has_affiliate else "Mismatch",
+        "photo_file_id": photo_file_id,
         "photo": photo_b64,
-        "has_photo": bool(photo_b64),
+        "has_photo": bool(photo_file_id),
         "timestamp": timestamp,
         "date": datetime.now().isoformat(),
         "deleted": False
     }
 
     proofs = load_proofs()
-    # Duplicate check
-    exists = any(p.get("channel_id") == str(chat.get("id")) and p.get("post_id") == post_id for p in proofs)
+    exists = any(
+        p.get("channel_id") == str(chat.get("id")) and
+        p.get("post_id") == post_id
+        for p in proofs
+    )
     if not exists:
         proofs.insert(0, proof)
         proofs = proofs[:500]
@@ -121,7 +126,6 @@ def process_message(message):
     return proof
 
 def poll_telegram():
-    """Telegram se naye messages fetch karo"""
     print("🤖 Polling started...")
     while True:
         try:
@@ -145,11 +149,9 @@ def poll_telegram():
                 update_id = update["update_id"]
                 save_offset(update_id + 1)
 
-                # Channel post
                 if "channel_post" in update:
                     process_message(update["channel_post"])
 
-                # Edited post — mark as edited
                 if "edited_channel_post" in update:
                     msg = update["edited_channel_post"]
                     proofs = load_proofs()
@@ -187,7 +189,7 @@ def get_proofs():
     lite = []
     for p in proofs:
         entry = {k: v for k, v in p.items() if k != "photo"}
-        entry["has_photo"] = bool(p.get("photo"))
+        entry["has_photo"] = bool(p.get("photo") or p.get("photo_file_id"))
         lite.append(entry)
     return jsonify(lite)
 
@@ -196,8 +198,35 @@ def get_proof(proof_id):
     proofs = load_proofs()
     for p in proofs:
         if p["id"] == proof_id:
+            # Agar photo nahi hai lekin file_id hai — fresh fetch karo
+            if not p.get("photo") and p.get("photo_file_id"):
+                print(f"🔄 Fetching photo on demand for {proof_id}")
+                photo_b64 = get_photo_base64(p["photo_file_id"])
+                if photo_b64:
+                    p["photo"] = photo_b64
+                    save_proofs(proofs)
             return jsonify(p)
     return jsonify({"error": "Not found"}), 404
+
+@flask_app.route("/photo/<proof_id>", methods=["GET"])
+def get_photo(proof_id):
+    """Photo directly image ke roop mein return karo"""
+    proofs = load_proofs()
+    for p in proofs:
+        if p["id"] == proof_id:
+            # Stored base64 se return karo
+            if p.get("photo"):
+                img_data = base64.b64decode(p["photo"])
+                return send_file(io.BytesIO(img_data), mimetype="image/jpeg")
+            # File ID se fresh fetch karo
+            if p.get("photo_file_id"):
+                photo_b64 = get_photo_base64(p["photo_file_id"])
+                if photo_b64:
+                    img_data = base64.b64decode(photo_b64)
+                    p["photo"] = photo_b64
+                    save_proofs(proofs)
+                    return send_file(io.BytesIO(img_data), mimetype="image/jpeg")
+    return jsonify({"error": "Photo not found"}), 404
 
 @flask_app.route("/proofs/<proof_id>", methods=["DELETE"])
 def delete_proof(proof_id):
@@ -219,15 +248,11 @@ def get_stats():
         "channels": channels
     })
 
-# ============================================
-# MAIN
-# ============================================
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN set nahi hai! Railway Variables mein add karo.")
+        print("❌ BOT_TOKEN set nahi hai!")
     else:
         print(f"✅ Bot token found")
-        # Polling thread mein chalao
         poll_thread = threading.Thread(target=poll_telegram, daemon=True)
         poll_thread.start()
         print(f"✅ Polling thread started")
