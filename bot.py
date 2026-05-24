@@ -1,27 +1,28 @@
 import os
 import json
-import asyncio
 import base64
+import asyncio
+import threading
 from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import threading
+import requests
 
 # ============================================
-# EARNKARO TELEGRAM BOT — Auto Screenshot System
+# EARNKARO BOT — Fixed Version
 # ============================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+PORT = int(os.environ.get("PORT", 8080))
+
 AFFILIATE_DOMAINS = [
     "ekaro.in", "earnkaro", "fktr.in", "amzn.to", "myntr.a",
     "ajio.com", "nykaa.com", "bit.ly", "clnk.in", "cuelinks",
     "optimisemedia", "vcommission", "admitad"
 ]
 
-# In-memory store (Railway pe persist hoga JSON file mein)
 DATA_FILE = "proofs.json"
+OFFSET_FILE = "offset.txt"
 
 def load_proofs():
     try:
@@ -34,54 +35,68 @@ def save_proofs(proofs):
     with open(DATA_FILE, "w") as f:
         json.dump(proofs, f, indent=2)
 
-def check_link(text):
+def get_offset():
+    try:
+        with open(OFFSET_FILE, "r") as f:
+            return int(f.read().strip())
+    except:
+        return 0
+
+def save_offset(offset):
+    with open(OFFSET_FILE, "w") as f:
+        f.write(str(offset))
+
+def check_affiliate_link(text):
     if not text:
         return False, None
-    words = text.split()
-    for word in words:
+    for word in text.split():
         for domain in AFFILIATE_DOMAINS:
             if domain in word.lower():
                 return True, word
     return False, None
 
-def extract_links(text):
+def extract_all_links(text):
     if not text:
         return []
     return [w for w in text.split() if w.startswith("http") or w.startswith("www")]
 
-# ============================================
-# TELEGRAM BOT — Post capture karta hai
-# ============================================
+def get_photo_base64(file_id):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
+        res = requests.get(url, timeout=10)
+        file_path = res.json()["result"]["file_path"]
+        photo_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        photo_res = requests.get(photo_url, timeout=15)
+        return base64.b64encode(photo_res.content).decode("utf-8")
+    except Exception as e:
+        print(f"Photo error: {e}")
+        return None
 
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Har channel post yahan aata hai"""
-    message = update.channel_post
-    if not message:
-        return
+def process_message(message):
+    """Telegram message ko process karo aur proof banao"""
+    chat = message.get("chat", {})
+    channel_name = chat.get("username") or chat.get("title") or str(chat.get("id", ""))
+    if channel_name and not channel_name.startswith("@"):
+        channel_name = "@" + channel_name
 
-    chat = message.chat
-    channel_name = chat.username or chat.title or str(chat.id)
-    text = message.text or message.caption or ""
-    post_id = message.message_id
+    text = message.get("text") or message.get("caption") or ""
+    post_id = message.get("message_id")
     timestamp = datetime.now().strftime("%d/%m/%Y %I:%M %p")
 
-    # Link check karo
-    has_affiliate, found_link = check_link(text)
-    all_links = extract_links(text)
+    has_affiliate, found_link = check_affiliate_link(text)
+    all_links = extract_all_links(text)
 
     # Photo capture
     photo_b64 = None
-    if message.photo:
-        photo = message.photo[-1]  # Best quality
-        file = await context.bot.get_file(photo.file_id)
-        photo_bytes = await file.download_as_bytearray()
-        photo_b64 = base64.b64encode(photo_bytes).decode("utf-8")
+    photos = message.get("photo")
+    if photos:
+        best_photo = photos[-1]
+        photo_b64 = get_photo_base64(best_photo["file_id"])
 
-    # Proof entry banao
     proof = {
-        "id": f"{chat.id}_{post_id}_{int(datetime.now().timestamp())}",
-        "channel": f"@{channel_name}" if channel_name and not channel_name.startswith("@") else channel_name,
-        "channel_id": str(chat.id),
+        "id": f"{chat.get('id')}_{post_id}_{int(datetime.now().timestamp())}",
+        "channel": channel_name,
+        "channel_id": str(chat.get("id", "")),
         "post_id": post_id,
         "text": text,
         "links": all_links,
@@ -89,53 +104,86 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         "has_affiliate_link": has_affiliate,
         "status": "Verified" if has_affiliate else "Mismatch",
         "photo": photo_b64,
+        "has_photo": bool(photo_b64),
         "timestamp": timestamp,
         "date": datetime.now().isoformat(),
         "deleted": False
     }
 
     proofs = load_proofs()
-    proofs.insert(0, proof)
-    # Max 500 proofs rakhein
-    proofs = proofs[:500]
-    save_proofs(proofs)
+    # Duplicate check
+    exists = any(p.get("channel_id") == str(chat.get("id")) and p.get("post_id") == post_id for p in proofs)
+    if not exists:
+        proofs.insert(0, proof)
+        proofs = proofs[:500]
+        save_proofs(proofs)
+        print(f"✅ Captured: {channel_name} | {proof['status']} | Link: {found_link}")
+    return proof
 
-    print(f"✅ Post captured: {channel_name} | Status: {proof['status']} | Link: {found_link}")
+def poll_telegram():
+    """Telegram se naye messages fetch karo"""
+    print("🤖 Polling started...")
+    while True:
+        try:
+            offset = get_offset()
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            params = {
+                "offset": offset,
+                "timeout": 30,
+                "allowed_updates": ["channel_post", "edited_channel_post"]
+            }
+            res = requests.get(url, params=params, timeout=40)
+            data = res.json()
 
-async def handle_edited_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Edit hone pe bhi capture karo"""
-    message = update.edited_channel_post
-    if not message:
-        return
+            if not data.get("ok"):
+                print(f"Telegram error: {data}")
+                import time; time.sleep(5)
+                continue
 
-    chat = message.chat
-    post_id = message.message_id
+            updates = data.get("result", [])
+            for update in updates:
+                update_id = update["update_id"]
+                save_offset(update_id + 1)
 
-    proofs = load_proofs()
-    for p in proofs:
-        if p.get("channel_id") == str(chat.id) and p.get("post_id") == post_id:
-            p["edited"] = True
-            p["edited_text"] = message.text or message.caption or ""
-            p["edited_time"] = datetime.now().strftime("%d/%m/%Y %I:%M %p")
-            break
-    save_proofs(proofs)
-    print(f"✏️ Post edited: {chat.username or chat.id} | Post: {post_id}")
+                # Channel post
+                if "channel_post" in update:
+                    process_message(update["channel_post"])
+
+                # Edited post — mark as edited
+                if "edited_channel_post" in update:
+                    msg = update["edited_channel_post"]
+                    proofs = load_proofs()
+                    for p in proofs:
+                        if (p.get("channel_id") == str(msg["chat"]["id"]) and
+                                p.get("post_id") == msg.get("message_id")):
+                            p["edited"] = True
+                            p["edited_text"] = msg.get("text") or msg.get("caption") or ""
+                            p["edited_time"] = datetime.now().strftime("%d/%m/%Y %I:%M %p")
+                            break
+                    save_proofs(proofs)
+
+        except Exception as e:
+            print(f"Poll error: {e}")
+            import time; time.sleep(5)
 
 # ============================================
-# FLASK API — Tool se connect hoga
+# FLASK API
 # ============================================
-
 flask_app = Flask(__name__)
 CORS(flask_app)
 
 @flask_app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "EarnKaro Bot running!", "proofs": len(load_proofs())})
+    proofs = load_proofs()
+    return jsonify({
+        "status": "EarnKaro Bot running!",
+        "total_proofs": len(proofs),
+        "bot_token_set": bool(BOT_TOKEN)
+    })
 
 @flask_app.route("/proofs", methods=["GET"])
 def get_proofs():
     proofs = load_proofs()
-    # Sensitive data (photo) chhota karein for listing
     lite = []
     for p in proofs:
         entry = {k: v for k, v in p.items() if k != "photo"}
@@ -171,30 +219,18 @@ def get_stats():
         "channels": channels
     })
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
 # ============================================
-# MAIN — Bot + API dono chalao
+# MAIN
 # ============================================
-
-def main():
-    if not BOT_TOKEN:
-        print("❌ BOT_TOKEN environment variable set nahi hai!")
-        return
-
-    # Flask API thread mein chalao
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print("✅ Flask API started")
-
-    # Telegram Bot chalao
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
-    app.add_handler(MessageHandler(filters.UpdateType.EDITED_CHANNEL_POSTS, handle_edited_post))
-
-    print("✅ EarnKaro Bot started — posts capture ho rahe hain!")
-    app.run_polling(allowed_updates=["channel_post", "edited_channel_post"])
-
 if __name__ == "__main__":
-    main()
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN set nahi hai! Railway Variables mein add karo.")
+    else:
+        print(f"✅ Bot token found")
+        # Polling thread mein chalao
+        poll_thread = threading.Thread(target=poll_telegram, daemon=True)
+        poll_thread.start()
+        print(f"✅ Polling thread started")
+
+    print(f"✅ Flask API starting on port {PORT}")
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False)
