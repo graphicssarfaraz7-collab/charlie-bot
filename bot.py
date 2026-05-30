@@ -26,23 +26,45 @@ DEALS_FILE = "deals.json"
 OFFSET_FILE = "offset.txt"
 
 # =========================
-# TELEGRAM HELPERS
+# HELPERS
 # =========================
 
-def extract_links_from_text(text):
+def load_json(file):
+    try:
+        with open(file, "r") as f:
+            return json.load(f)
+    except:
+        return []
+
+def save_json(file, data):
+    with open(file, "w") as f:
+        json.dump(data, f, indent=2)
+
+def extract_links(text):
     if not text:
         return []
     return re.findall(r'https?://[^\s]+', text)
 
+# =========================
+# URL RESOLVER (FIXED)
+# =========================
 
 def follow_redirects(url):
     try:
-        r = requests.get(url, allow_redirects=True, timeout=10,
-                         headers={"User-Agent": "Mozilla/5.0"})
+        session = requests.Session()
+        r = session.get(
+            url,
+            allow_redirects=True,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         return r.url
     except:
         return url
 
+# =========================
+# PRODUCT ID EXTRACTION
+# =========================
 
 def extract_product_id(url):
     final_url = follow_redirects(url)
@@ -61,26 +83,8 @@ def extract_product_id(url):
 
     return {"platform": "unknown", "product_id": None, "final_url": final_url}
 
-
 # =========================
-# FILE OPS
-# =========================
-
-def load_json(file):
-    try:
-        with open(file, "r") as f:
-            return json.load(f)
-    except:
-        return []
-
-
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-# =========================
-# DEAL LOGIC (NEW CORE)
+# DEAL LOGIC
 # =========================
 
 def match_alias(text, deal):
@@ -88,9 +92,8 @@ def match_alias(text, deal):
     text = (text or "").lower()
     return any(a.lower() in text for a in aliases)
 
-
 def time_valid(deal):
-    window = deal.get("valid_minutes", 60)
+    window = deal.get("valid_minutes", 999999)
     created = deal.get("added")
 
     if not created:
@@ -102,21 +105,8 @@ def time_valid(deal):
     except:
         return True
 
-
-def price_valid(deal, price=None):
-    if not deal.get("price_range"):
-        return True
-    try:
-        if price is None:
-            return True
-        mn, mx = deal["price_range"]
-        return mn <= float(price) <= mx
-    except:
-        return True
-
-
 # =========================
-# ENKR VERIFICATION (NEW)
+# ENKR (OPTIONAL)
 # =========================
 
 def get_enkr(short_url):
@@ -127,81 +117,76 @@ def get_enkr(short_url):
 
         html = r.text
 
-        patterns = [
-            r"ENKR[:\s]*([A-Z0-9]+)",
-            r"enkr[:\s]*([A-Z0-9]+)"
-        ]
-
-        for p in patterns:
-            m = re.search(p, html, re.IGNORECASE)
-            if m:
-                return m.group(1)
+        match = re.search(r"ENKR[:\s]*([A-Z0-9]+)", html, re.IGNORECASE)
+        if match:
+            return match.group(1)
 
         return None
     except:
         return None
 
-
 # =========================
-# VERIFICATION ENGINE (FINAL)
+# CORE VERIFICATION (FIXED LOGIC)
 # =========================
 
 def verify_post(text, links):
     deals = load_json(DEALS_FILE)
 
-    for link in links:
-        result = extract_product_id(link)
-        post_pid = result.get("product_id")
+    for deal in deals:
 
-        for deal in deals:
-            deal_pid = deal.get("product_id")
+        # STEP 1: ALWAYS TRY ALIAS FIRST (FIXED)
+        if not match_alias(text, deal):
+            continue
 
-            # STEP 1: product match
-            if deal_pid and post_pid and deal_pid.upper() == post_pid.upper():
+        # STEP 2: TIME CHECK
+        if not time_valid(deal):
+            return "Mismatch", None, "Time window expired"
 
-                # STEP 2: alias match
-                if not match_alias(text, deal):
+        deal_pid = deal.get("product_id")
+
+        # STEP 3: IF LINKS EXIST → TRY PRODUCT MATCH
+        for link in links:
+            result = extract_product_id(link)
+            post_pid = result.get("product_id")
+
+            # IF BOTH EXIST → STRICT MATCH
+            if deal_pid and post_pid:
+                if deal_pid.upper() != post_pid.upper():
                     continue
 
-                # STEP 3: time check
-                if not time_valid(deal):
-                    return "Mismatch", None, "Time window expired"
+        # STEP 4: OPTIONAL ENKR CHECK
+        if deal.get("enkr"):
+            enkr = get_enkr(deal.get("original_link"))
+            if enkr and enkr != deal["enkr"]:
+                return "Mismatch", None, "ENKR mismatch"
 
-                # STEP 4: ENKR check
-                if deal.get("enkr"):
-                    enkr = get_enkr(deal.get("original_link"))
-                    if enkr and enkr != deal["enkr"]:
-                        return "Mismatch", None, "ENKR mismatch"
+        return "Verified", deal, "Alias match success"
 
-                return "Verified", deal, f"Matched {post_pid}"
-
-    return "Mismatch", None, "No match found"
-
+    return "Mismatch", None, "No matching deal"
 
 # =========================
-# SCREENSHOT
+# SCREENSHOT (SIMPLE)
 # =========================
 
 def generate_screenshot(text, status, deal=None):
     if not PIL_AVAILABLE:
         return None
 
-    img = Image.new("RGB", (800, 400), (30, 30, 30))
+    img = Image.new("RGB", (800, 350), (30, 30, 30))
     draw = ImageDraw.Draw(img)
 
-    draw.text((20, 20), text[:80], fill=(255, 255, 255))
-    draw.text((20, 100), f"Status: {status}", fill=(0, 255, 0) if status=="Verified" else (255,0,0))
+    draw.text((20, 20), text[:90], fill=(255, 255, 255))
+    draw.text((20, 120), f"Status: {status}", fill=(0,255,0) if status=="Verified" else (255,0,0))
 
     if deal:
-        draw.text((20, 150), f"Deal: {deal.get('title')}", fill=(200,200,200))
+        draw.text((20, 180), deal.get("title",""), fill=(200,200,200))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
 
-
 # =========================
-# TELEGRAM PROCESSOR
+# PROCESS MESSAGE
 # =========================
 
 def process_message(msg):
@@ -209,7 +194,7 @@ def process_message(msg):
     chat = msg.get("chat", {})
     post_id = msg.get("message_id")
 
-    links = extract_links_from_text(text)
+    links = extract_links(text)
 
     status, deal, reason = verify_post(text, links)
 
@@ -232,13 +217,13 @@ def process_message(msg):
 
     print(f"[{status}] {reason}")
 
-
 # =========================
-# POLLING
+# TELEGRAM POLLING
 # =========================
 
 def poll():
     offset = 0
+
     while True:
         try:
             r = requests.get(
@@ -261,7 +246,6 @@ def poll():
             print("poll error:", e)
             time.sleep(5)
 
-
 # =========================
 # FLASK API
 # =========================
@@ -269,16 +253,17 @@ def poll():
 app = Flask(__name__)
 CORS(app)
 
+@app.route("/")
+def home():
+    return jsonify({"status": "running"})
 
 @app.route("/proofs")
 def proofs():
     return jsonify(load_json(DATA_FILE))
 
-
-@app.route("/deals", methods=["GET"])
+@app.route("/deals")
 def deals():
     return jsonify(load_json(DEALS_FILE))
-
 
 @app.route("/deals", methods=["POST"])
 def add_deal():
@@ -290,8 +275,7 @@ def add_deal():
         "aliases": data.get("aliases", []),
         "product_id": data.get("product_id"),
         "enkr": data.get("enkr"),
-        "valid_minutes": data.get("valid_minutes", 60),
-        "price_range": data.get("price_range"),
+        "valid_minutes": data.get("valid_minutes", 999999),
         "original_link": data.get("link"),
         "added": datetime.now().isoformat()
     }
@@ -302,12 +286,6 @@ def add_deal():
 
     return jsonify(deal)
 
-
-@app.route("/")
-def home():
-    return jsonify({"status": "running"})
-
-
 # =========================
 # START
 # =========================
@@ -316,4 +294,5 @@ if __name__ == "__main__":
     if BOT_TOKEN:
         threading.Thread(target=poll, daemon=True).start()
         print("Bot started")
+
     app.run(host="0.0.0.0", port=PORT)
